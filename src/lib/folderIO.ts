@@ -150,6 +150,111 @@ export async function writeDSLFileAt(relPath: string, content: string): Promise<
   }
 }
 
+/** Write a set of text files under an arbitrary directory handle, creating
+ *  intermediate directories and overwriting files that already exist. Used by
+ *  exports that produce a tree (the OKF bundle) rather than a single file;
+ *  unlike the DSL writers it takes the handle explicitly, so it never touches
+ *  the open collection. Rejects any path that would escape the directory. */
+export async function writeFilesInto(
+  dir: FileSystemDirectoryHandle,
+  files: ReadonlyArray<{ path: string; content: string }>,
+): Promise<void> {
+  // Directory handles resolved once per directory, not once per file.
+  const dirs = new Map<string, FileSystemDirectoryHandle>([['', dir]])
+  for (const file of files) {
+    const parts = exportPathParts(file.path, 'write')
+    let cur = dir
+    let key = ''
+    for (const seg of parts.slice(0, -1)) {
+      key = `${key}${seg}/`
+      let next = dirs.get(key)
+      if (!next) dirs.set(key, (next = await cur.getDirectoryHandle(seg, { create: true })))
+      cur = next
+    }
+    const handle = await cur.getFileHandle(parts[parts.length - 1], { create: true })
+    const writable = await handle.createWritable()
+    await writable.write(file.content)
+    await writable.close()
+  }
+}
+
+/** Segments of a path inside a chosen export directory, rejecting anything
+ *  that would escape it. */
+function exportPathParts(path: string, verb: 'write' | 'read' | 'delete'): string[] {
+  const parts = path.split('/').filter((p) => p !== '' && p !== '.')
+  if (parts.length === 0 || parts.some((p) => p === '..')) {
+    throw new Error(`Refusing to ${verb} outside the chosen folder: ${path}`)
+  }
+  return parts
+}
+
+/** Read one text file under an arbitrary directory handle; `null` when it is
+ *  not there. Used to recognise a folder a previous export wrote. */
+export async function readFileIn(
+  dir: FileSystemDirectoryHandle,
+  path: string,
+): Promise<string | null> {
+  const parts = exportPathParts(path, 'read')
+  try {
+    let cur = dir
+    for (const seg of parts.slice(0, -1)) cur = await cur.getDirectoryHandle(seg)
+    const handle = await cur.getFileHandle(parts[parts.length - 1])
+    return await readTextFileWithLimit(await handle.getFile(), 'Bundle file')
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'NotFoundError') return null
+    throw err
+  }
+}
+
+/** Files directly inside `dir` and inside each named subdirectory, as paths
+ *  relative to `dir`. Missing subdirectories are skipped, and nothing
+ *  recurses deeper — a bundle is two levels and the caller names the
+ *  directories it owns, so a folder holding anything else is never walked. */
+export async function listFilesIn(
+  dir: FileSystemDirectoryHandle,
+  subdirs: ReadonlyArray<string>,
+): Promise<string[]> {
+  const found: string[] = []
+  const collect = async (handle: FileSystemDirectoryHandle, prefix: string) => {
+    for await (const [name, entry] of handle.entries()) {
+      if (entry.kind === 'file') found.push(`${prefix}${name}`)
+    }
+  }
+  await collect(dir, '')
+  for (const name of subdirs) {
+    try {
+      await collect(await dir.getDirectoryHandle(name), `${name}/`)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'NotFoundError') continue
+      throw err
+    }
+  }
+  return found.sort()
+}
+
+/** Delete files by path relative to `dir`, returning the ones that went. A
+ *  file that is already gone is not an error, and neither is one the browser
+ *  refuses to delete: tidying up is never worth failing an export over. */
+export async function removeFilesIn(
+  dir: FileSystemDirectoryHandle,
+  paths: ReadonlyArray<string>,
+): Promise<string[]> {
+  const removed: string[] = []
+  for (const path of paths) {
+    const parts = exportPathParts(path, 'delete')
+    try {
+      let cur = dir
+      for (const seg of parts.slice(0, -1)) cur = await cur.getDirectoryHandle(seg)
+      await cur.removeEntry(parts[parts.length - 1])
+      removed.push(path)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'NotFoundError') continue
+      log.warn('Could not remove stale file', { path, err })
+    }
+  }
+  return removed
+}
+
 /** Read a workspace file for the disk watcher. Unlike `readDSLFile` this is
  *  silent and distinguishes "gone" (`null`) from a transient failure (throws),
  *  because it runs every couple of seconds. */

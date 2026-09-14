@@ -50,6 +50,53 @@ describe('ExportDialog', () => {
     await waitFor(() => expect(props.onExport).toHaveBeenCalledWith('html'))
   })
 
+  it('offers the OKF bundle as a zip everywhere, and as a folder only where the directory picker exists', async () => {
+    const orig = (window as Record<string, unknown>).showDirectoryPicker
+    delete (window as Record<string, unknown>).showDirectoryPicker
+    try {
+      const props = renderDialog()
+      expect(screen.queryByRole('button', { name: 'Save OKF bundle to a folder' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Download OKF bundle as zip' }))
+      await waitFor(() => expect(props.onExport).toHaveBeenCalledWith('okf-zip'))
+    } finally {
+      if (orig !== undefined) (window as Record<string, unknown>).showDirectoryPicker = orig
+    }
+  })
+
+  it('offers the folder target when showDirectoryPicker is available', async () => {
+    vi.stubGlobal('showDirectoryPicker', vi.fn())
+    try {
+      const props = renderDialog()
+      fireEvent.click(screen.getByRole('button', { name: 'Save OKF bundle to a folder' }))
+      await waitFor(() => expect(props.onExport).toHaveBeenCalledWith('okf-folder'))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('marks an export that went through, and one that was cancelled', async () => {
+    vi.stubGlobal('showDirectoryPicker', vi.fn())
+    try {
+      // A folder export the user cancelled resolves false: nothing was
+      // written, so the row must not claim success.
+      const cancelled = vi.fn().mockResolvedValue(false)
+      const { unmount } = render(<ExportDialog onExport={cancelled} onCopy={vi.fn()} onClose={vi.fn()} />)
+      const button = screen.getByRole('button', { name: 'Save OKF bundle to a folder' })
+      fireEvent.click(button)
+      await waitFor(() => expect(button.hasAttribute('disabled')).toBe(false))
+      expect(button.getAttribute('style')).not.toContain('tint-success')
+      unmount()
+
+      const exported = vi.fn().mockResolvedValue(undefined)
+      render(<ExportDialog onExport={exported} onCopy={vi.fn()} onClose={vi.fn()} />)
+      const second = screen.getByRole('button', { name: 'Save OKF bundle to a folder' })
+      fireEvent.click(second)
+      await waitFor(() => expect(second.getAttribute('style')).toContain('tint-success'))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('gives the two Download buttons distinct accessible names', () => {
     renderDialog()
     expect(screen.getByRole('button', { name: 'Download interactive HTML' })).toBeTruthy()

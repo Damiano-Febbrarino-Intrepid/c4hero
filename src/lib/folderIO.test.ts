@@ -8,6 +8,10 @@ import {
   listDSLFiles,
   restoreDirHandle,
   getCurrentDirHandle,
+  writeFilesInto,
+  readFileIn,
+  listFilesIn,
+  removeFilesIn,
 } from './folderIO'
 
 afterEach(() => {
@@ -426,3 +430,140 @@ function makeIDBMock(idbStore: Record<string, unknown>) {
     },
   }
 }
+
+// ─── writeFilesInto ──────────────────────────────────────────────────
+
+describe('writeFilesInto()', () => {
+  /** A directory tree that records every file written under it. */
+  function makeTree(written: Map<string, string>, prefix = ''): FileSystemDirectoryHandle {
+    const dirs = new Map<string, FileSystemDirectoryHandle>()
+    return {
+      kind: 'directory',
+      name: prefix || 'root',
+      getDirectoryHandle: async (name: string, opts?: { create?: boolean }) => {
+        if (!opts?.create) throw new DOMException('Not found', 'NotFoundError')
+        let dir = dirs.get(name)
+        if (!dir) dirs.set(name, (dir = makeTree(written, `${prefix}${name}/`)))
+        return dir
+      },
+      getFileHandle: async (name: string, opts?: { create?: boolean }) => {
+        if (!opts?.create) throw new DOMException('Not found', 'NotFoundError')
+        return {
+          kind: 'file',
+          name,
+          createWritable: async () => ({
+            write: async (d: string) => { written.set(`${prefix}${name}`, d) },
+            close: async () => {},
+          }),
+        }
+      },
+    } as unknown as FileSystemDirectoryHandle
+  }
+
+  it('creates intermediate directories and writes every file', async () => {
+    const written = new Map<string, string>()
+    await writeFilesInto(makeTree(written), [
+      { path: 'index.md', content: 'root' },
+      { path: 'systems/index.md', content: 'systems' },
+      { path: 'systems/shop.md', content: 'shop' },
+      { path: 'a/b/c.md', content: 'deep' },
+    ])
+    expect([...written.entries()]).toEqual([
+      ['index.md', 'root'],
+      ['systems/index.md', 'systems'],
+      ['systems/shop.md', 'shop'],
+      ['a/b/c.md', 'deep'],
+    ])
+  })
+
+  it('refuses paths that would escape the chosen directory', async () => {
+    const written = new Map<string, string>()
+    await expect(writeFilesInto(makeTree(written), [{ path: '../escape.md', content: 'x' }]))
+      .rejects.toThrow(/outside the chosen folder/)
+    await expect(writeFilesInto(makeTree(written), [{ path: '', content: 'x' }]))
+      .rejects.toThrow(/outside the chosen folder/)
+    expect(written.size).toBe(0)
+  })
+})
+
+// ─── readFileIn / listFilesIn / removeFilesIn ────────────────────────
+
+describe('reading, listing and removing inside a chosen folder', () => {
+  /** A directory tree built from `path -> content`, backed by a live map so a
+   *  removal is visible to the next read. */
+  function makeFolder(files: Map<string, string>, prefix = ''): FileSystemDirectoryHandle {
+    const under = () => [...files.keys()].filter((p) => p.startsWith(prefix))
+    return {
+      kind: 'directory',
+      name: prefix || 'root',
+      entries: async function* () {
+        const seen = new Set<string>()
+        for (const path of under()) {
+          const rest = path.slice(prefix.length)
+          const slash = rest.indexOf('/')
+          const name = slash === -1 ? rest : rest.slice(0, slash)
+          if (seen.has(name)) continue
+          seen.add(name)
+          yield [name, { kind: slash === -1 ? 'file' : 'directory', name }]
+        }
+      },
+      getDirectoryHandle: async (name: string) => {
+        const sub = `${prefix}${name}/`
+        if (!under().some((p) => p.startsWith(sub))) {
+          throw new DOMException('Not found', 'NotFoundError')
+        }
+        return makeFolder(files, sub)
+      },
+      getFileHandle: async (name: string) => {
+        const path = `${prefix}${name}`
+        if (!files.has(path)) throw new DOMException('Not found', 'NotFoundError')
+        return { kind: 'file', name, getFile: async () => new File([files.get(path)!], name) }
+      },
+      removeEntry: async (name: string) => {
+        const path = `${prefix}${name}`
+        if (!files.delete(path)) throw new DOMException('Not found', 'NotFoundError')
+      },
+    } as unknown as FileSystemDirectoryHandle
+  }
+
+  const bundle = () => new Map([
+    ['index.md', '---\nokf_version: "0.1"\n---\n'],
+    ['systems/index.md', '# Systems'],
+    ['systems/shop.md', '# Shop'],
+    ['notes.txt', 'mine'],
+    ['holiday/photo.md', 'not a bundle directory'],
+  ])
+
+  it('reads a file, and answers null for one that is not there', async () => {
+    const dir = makeFolder(bundle())
+    expect(await readFileIn(dir, 'systems/shop.md')).toBe('# Shop')
+    expect(await readFileIn(dir, 'systems/gone.md')).toBeNull()
+    expect(await readFileIn(dir, 'nowhere/gone.md')).toBeNull()
+  })
+
+  it('lists the root and the named subdirectories, and nothing else', async () => {
+    const dir = makeFolder(bundle())
+    expect(await listFilesIn(dir, ['systems', 'people'])).toEqual([
+      'index.md',
+      'notes.txt',
+      'systems/index.md',
+      'systems/shop.md',
+    ])
+  })
+
+  it('removes files and reports the ones that went', async () => {
+    const files = bundle()
+    const dir = makeFolder(files)
+    expect(await removeFilesIn(dir, ['systems/shop.md', 'systems/never.md'])).toEqual(['systems/shop.md'])
+    expect(files.has('systems/shop.md')).toBe(false)
+    expect(files.has('systems/index.md')).toBe(true)
+  })
+
+  it('refuses to read or remove outside the chosen folder', async () => {
+    const files = bundle()
+    const dir = makeFolder(files)
+    await expect(readFileIn(dir, '../secrets.md')).rejects.toThrow(/outside the chosen folder/)
+    await expect(removeFilesIn(dir, ['../secrets.md'])).rejects.toThrow(/outside the chosen folder/)
+    expect(files.size).toBe(5)
+  })
+})

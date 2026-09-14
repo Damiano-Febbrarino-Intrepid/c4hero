@@ -1,14 +1,19 @@
 import { useState, useEffect, useRef } from 'react'
-import { Download, Copy, Check } from 'lucide-react'
+import { Download, Copy, Check, FolderDown } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { ExportTheme } from '@/lib/exportUtils'
+import { hasDirectoryAccess } from '@/lib/fileIO'
 import { createLogger } from '@/lib/logger'
 import DialogShell from '@/components/shared/DialogShell'
 
 const log = createLogger('ExportDialog')
 
+export type ExportFormat = 'dsl' | 'png' | 'svg' | 'html' | 'okf-folder' | 'okf-zip'
+
 interface ExportDialogProps {
-  onExport: (format: 'dsl' | 'png' | 'svg' | 'html', theme?: ExportTheme) => Promise<void>
+  /** Resolves `false` when nothing was exported after all — a cancelled file
+   *  picker is not a failure, but it must not flash the success check. */
+  onExport: (format: ExportFormat, theme?: ExportTheme) => Promise<void | boolean>
   onCopy: (type: 'png-dark' | 'png-light' | 'png-current' | 'dsl') => Promise<void>
   onClose: () => void
 }
@@ -20,7 +25,7 @@ interface ExportAction {
   /** Screen-reader name, when the visible label repeats across rows
    *  ("Download" appears under more than one format). */
   ariaLabel?: string
-  fn: () => Promise<void>
+  fn: () => Promise<void | boolean>
 }
 
 export default function ExportDialog({ onExport, onCopy, onClose }: ExportDialogProps) {
@@ -32,11 +37,12 @@ export default function ExportDialog({ onExport, onCopy, onClose }: ExportDialog
     if (doneTimer.current) clearTimeout(doneTimer.current)
   }, [])
 
-  async function act(key: string, fn: () => Promise<void>) {
+  async function act(key: string, fn: () => Promise<void | boolean>) {
     if (busy) return
     setBusy(key)
     try {
-      await fn()
+      const exported = await fn()
+      if (exported === false) return
       setDone(key)
       if (doneTimer.current) clearTimeout(doneTimer.current)
       doneTimer.current = setTimeout(() => setDone((d) => (d === key ? null : d)), 1500)
@@ -118,6 +124,18 @@ export default function ExportDialog({ onExport, onCopy, onClose }: ExportDialog
       ext: '.html — one file, works offline',
       actions: [
         { id: 'dl-.html', icon: Download, label: 'Download', ariaLabel: 'Download interactive HTML', fn: () => onExport('html') },
+      ],
+    },
+    {
+      label: 'OKF knowledge bundle',
+      ext: 'folder of .md files — the model as knowledge for docs tools and AI agents',
+      actions: [
+        // The folder picker is File System Access API, Chromium only; the zip
+        // works everywhere.
+        ...(hasDirectoryAccess()
+          ? [{ id: 'dir-okf', icon: FolderDown, label: 'Save to folder', ariaLabel: 'Save OKF bundle to a folder', fn: () => onExport('okf-folder') }]
+          : []),
+        { id: 'dl-okf.zip', icon: Download, label: 'Download .zip', ariaLabel: 'Download OKF bundle as zip', fn: () => onExport('okf-zip') },
       ],
     },
     {
